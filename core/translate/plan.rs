@@ -39,18 +39,26 @@ impl ResultSetColumn {
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
-                let joined_table_ref = tables.find_joined_table_by_internal_id(*table).unwrap();
+                let joined_table_ref = tables
+                    .find_joined_table_by_internal_id(*table)
+                    .expect("table internal ID is valid");
                 if let Operation::IndexMethodQuery(module) = &joined_table_ref.op {
                     if module.covered_columns.contains_key(column) {
                         return None;
                     }
                 }
                 let table_ref = &joined_table_ref.table;
-                table_ref.get_column_at(*column).unwrap().name.as_deref()
+                table_ref
+                    .get_column_at(*column)
+                    .expect("column index is valid")
+                    .name
+                    .as_deref()
             }
             ast::Expr::RowId { table, .. } => {
                 // If there is a rowid alias column, use its name
-                let (_, table_ref) = tables.find_table_by_internal_id(*table).unwrap();
+                let (_, table_ref) = tables
+                    .find_table_by_internal_id(*table)
+                    .expect("table internal ID is valid");
                 if let Table::BTree(table) = &table_ref {
                     if let Some(rowid_alias_column) = table.get_rowid_alias_column() {
                         if let Some(name) = &rowid_alias_column.1.name {
@@ -428,11 +436,18 @@ impl SelectPlan {
         {
             return false;
         }
-        let table_ref = self.table_references.joined_tables().first().unwrap();
+        let table_ref = self
+            .table_references
+            .joined_tables()
+            .first()
+            .expect("checked table count above");
         if !matches!(table_ref.table, crate::schema::Table::BTree(..)) {
             return false;
         }
-        let agg = self.aggregates.first().unwrap();
+        let agg = self
+            .aggregates
+            .first()
+            .expect("checked aggregates.len() == 1 above");
         if !matches!(agg.func, AggFunc::Count0) {
             return false;
         }
@@ -454,7 +469,11 @@ impl SelectPlan {
                 over_clause: None,
             },
         };
-        let result_col_expr = &self.result_columns.first().unwrap().expr;
+        let result_col_expr = &self
+            .result_columns
+            .first()
+            .expect("checked result_columns.len() == 1 above")
+            .expr;
         if *result_col_expr != count && *result_col_expr != count_star {
             return false;
         }
@@ -1149,7 +1168,11 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, SeekKeyComponent<&'a ast::Expr>> {
     fn next(&mut self) -> Option<Self::Item> {
         let result = if self.pos < self.seek_def.prefix.len() {
             Some(SeekKeyComponent::Expr(
-                &self.seek_def.prefix[self.pos].eq.as_ref().unwrap().1,
+                &self.seek_def.prefix[self.pos]
+                    .eq
+                    .as_ref()
+                    .expect("prefix entries have eq")
+                    .1,
             ))
         } else if self.pos == self.seek_def.prefix.len() {
             match &self.seek_key.last_component {
@@ -1169,7 +1192,13 @@ impl<'a> Iterator for SeekDefKeyIterator<'a, Affinity> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let result = if self.pos < self.seek_def.prefix.len() {
-            Some(self.seek_def.prefix[self.pos].eq.as_ref().unwrap().2)
+            Some(
+                self.seek_def.prefix[self.pos]
+                    .eq
+                    .as_ref()
+                    .expect("prefix entries have eq")
+                    .2,
+            )
         } else if self.pos == self.seek_def.prefix.len() {
             match &self.seek_key.last_component {
                 SeekKeyComponent::Expr(..) => Some(self.seek_key.affinity),
@@ -1498,9 +1527,8 @@ impl NonFromClauseSubquery {
         let SubqueryState::Unevaluated { plan } = &self.state else {
             crate::bail_parse_error!("subquery has already been evaluated");
         };
-        let used_outer_refs = plan
-            .as_ref()
-            .unwrap()
+        let plan_ref = plan.as_ref().expect("checked unevaluated state above");
+        let used_outer_refs = plan_ref
             .table_references
             .outer_query_refs()
             .iter()
@@ -1515,7 +1543,7 @@ impl NonFromClauseSubquery {
             };
             eval_at = eval_at.max(EvalAt::Loop(loop_idx));
         }
-        for subquery in plan.as_ref().unwrap().non_from_clause_subqueries.iter() {
+        for subquery in plan_ref.non_from_clause_subqueries.iter() {
             let eval_at_inner = subquery.get_eval_at(join_order)?;
             eval_at = eval_at.max(eval_at_inner);
         }
@@ -1527,7 +1555,7 @@ impl NonFromClauseSubquery {
     pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<SelectPlan> {
         match &mut self.state {
             SubqueryState::Unevaluated { plan } => {
-                let plan = plan.take().unwrap();
+                let plan = plan.take().expect("plan exists in unevaluated state");
                 self.state = SubqueryState::Evaluated { evaluated_at };
                 plan
             }
@@ -1565,7 +1593,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system time is after UNIX epoch")
                 .as_secs(),
         );
 
@@ -1598,7 +1626,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("system time is after UNIX epoch")
                 .as_secs(),
         );
 
