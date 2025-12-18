@@ -314,15 +314,7 @@ impl File for UnixFile {
         let file = self.file.lock();
 
         let result = unsafe {
-            #[cfg(not(target_vendor = "apple"))]
-            {
                 libc::fsync(file.as_raw_fd())
-            }
-
-            #[cfg(target_vendor = "apple")]
-            {
-                libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC)
-            }
         };
 
         if result == -1 {

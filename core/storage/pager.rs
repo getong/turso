@@ -1849,7 +1849,10 @@ impl Pager {
                     Err(e) => Err(e.into()),
                 }
             }
-            IOResult::Done(false) => Err(LimboError::Busy),
+            IOResult::Done(false) => {
+                eprintln!("[BUSY] cache_insert failed to make room for page, returning Busy");
+                Err(LimboError::Busy)
+            }
             IOResult::IO(c) => Ok(IOResult::IO(c)),
         }
     }
@@ -2660,6 +2663,7 @@ impl Pager {
                     // Auto-checkpoint does NOT clear page cache (only explicit checkpoints do)
                     match self.checkpoint(checkpoint_mode, sync_mode, false) {
                         Err(LimboError::Busy) => {
+                            eprintln!("[BUSY] Auto-checkpoint skipped due to busy (lock conflict)");
                             // Auto-checkpoint during commit uses Passive mode, which can return
                             // Busy if either:
                             // 1. Another connection is already checkpointing (checkpoint_lock held)

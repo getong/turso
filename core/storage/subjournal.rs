@@ -26,6 +26,7 @@ impl Subjournal {
             .in_use
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
         if result.is_err() {
+            eprintln!("[BUSY] Subjournal: try_use failed, returning Busy");
             return Err(crate::LimboError::Busy);
         }
         Ok(())

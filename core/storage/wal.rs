@@ -736,40 +736,40 @@ impl CheckpointLocks {
         {
             let shared = ptr.write();
             if !shared.checkpoint_lock.write() {
-                tracing::trace!("CheckpointGuard::new: checkpoint lock failed, returning Busy");
+                eprintln!("[BUSY] CheckpointGuard::new: checkpoint lock failed, returning Busy");
                 return Err(LimboError::Busy);
             }
             match mode {
                 CheckpointMode::Passive { .. } => {
                     if !shared.read_locks[0].write() {
                         shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
+                        eprintln!("[BUSY] CheckpointGuard: read0 lock failed, returning Busy");
                         return Err(LimboError::Busy);
                     }
                 }
                 CheckpointMode::Full => {
                     if !shared.read_locks[0].write() {
                         shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: read0 lock failed (Full), Busy");
+                        eprintln!("[BUSY] CheckpointGuard: read0 lock failed (Full), Busy");
                         return Err(LimboError::Busy);
                     }
                     if !shared.write_lock.write() {
                         shared.read_locks[0].unlock();
                         shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: write lock failed (Full), Busy");
+                        eprintln!("[BUSY] CheckpointGuard: write lock failed (Full), Busy");
                         return Err(LimboError::Busy);
                     }
                 }
                 CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
                     if !shared.read_locks[0].write() {
                         shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
+                        eprintln!("[BUSY] CheckpointGuard: read0 lock failed, returning Busy");
                         return Err(LimboError::Busy);
                     }
                     if !shared.write_lock.write() {
                         shared.checkpoint_lock.unlock();
                         shared.read_locks[0].unlock();
-                        tracing::trace!("CheckpointGuard: write lock failed, returning Busy");
+                        eprintln!("[BUSY] CheckpointGuard: write lock failed, returning Busy");
                         return Err(LimboError::Busy);
                     }
                 }
@@ -803,14 +803,18 @@ impl Drop for CheckpointLocks {
     }
 }
 
-impl Wal for WalFile {
-    /// Begin a read transaction. The caller must ensure that there is not already
-    /// an ongoing read transaction.
-    /// Returns whether the database state has changed since the last read transaction.
-    /// sqlite/src/wal.c 3023
-    /// assert(pWal->readLock < 0); /* Not currently locked */
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn begin_read_tx(&self) -> Result<bool> {
+/// Result of try_begin_read_tx - either success or a retriable condition.
+enum TryBeginReadResult {
+    /// Successfully started read transaction, returns whether DB changed
+    Ok(bool),
+    /// Transient condition, caller should retry immediately (like SQLite's WAL_RETRY)
+    Retry,
+}
+
+impl WalFile {
+    /// Try to begin a read transaction. Returns Retry for transient conditions
+    /// that should be retried immediately, Ok for success.
+    fn try_begin_read_tx(&self) -> TryBeginReadResult {
         turso_assert!(
             self.max_frame_read_lock_index
                 .load(Ordering::Acquire)
@@ -838,8 +842,8 @@ impl Wal for WalFile {
             tracing::debug!("begin_read_tx: WAL is already fully back‑filled into the main DB image, shared_max={}, nbackfills={}", shared_max, nbackfills);
             let lock_0_idx = 0;
             if !self.with_shared(|shared| shared.read_locks[lock_0_idx].read()) {
-                tracing::debug!("begin_read_tx: read lock 0 is already held, returning Busy");
-                return Err(LimboError::Busy);
+                eprintln!("[BUSY] begin_read_tx: read_locks[0].read() failed");
+                return TryBeginReadResult::Retry;
             }
             // we need to keep self.max_frame set to the appropriate
             // max frame in the wal at the time this transaction starts.
@@ -851,7 +855,7 @@ impl Wal for WalFile {
             self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
             self.transaction_count
                 .store(transaction_count, Ordering::Release);
-            return Ok(db_changed);
+            return TryBeginReadResult::Ok(db_changed);
         }
 
         // If we get this far, it means that the reader will want to use
@@ -888,27 +892,35 @@ impl Wal for WalFile {
             })
         }
 
-        if best_idx == -1 || best_mark != shared_max as u32 {
-            // If we cannot find a valid slot or the highest readmark has a stale max frame, we must return busy;
-            // otherwise we would not see some committed changes.
-            return Err(LimboError::Busy);
+        // SQLite only requires finding SOME slot (mxI != 0), not that the mark equals mxFrame.
+        // A stale mark is fine - the reader uses shared_max (cached mxFrame) for reading,
+        // and the mark just tells the checkpointer what frames are protected.
+        if best_idx == -1 {
+            eprintln!("[BUSY] begin_read_tx: no valid slot found");
+            return TryBeginReadResult::Retry;
         }
 
         // Now take a shared read on that slot, and if we are successful,
-        // grab another snapshot of the shared state.
-        let (mx2, nb2, cksm2, ckpt_seq2) = self.with_shared(|shared| {
+        // grab another snapshot of the shared state AND the slot's current mark.
+        let read_result = self.with_shared(|shared| {
             if !shared.read_locks[best_idx as usize].read() {
-                // TODO: we should retry here instead of always returning Busy
-                return Err(LimboError::Busy);
+                return None;
             }
             let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
-            Ok((
+            let current_slot_mark = shared.read_locks[best_idx as usize].get_value();
+            Some((
                 shared.max_frame.load(Ordering::Acquire),
                 shared.nbackfills.load(Ordering::Acquire),
                 shared.last_checksum,
                 checkpoint_seq,
+                current_slot_mark,
             ))
-        })?;
+        });
+
+        let Some((mx2, nb2, cksm2, ckpt_seq2, current_slot_mark)) = read_result else {
+            eprintln!("[BUSY] begin_read_tx: read_locks[{}].read() failed after finding slot", best_idx);
+            return TryBeginReadResult::Retry;
+        };
 
         // sqlite/src/wal.c 3225
         // Now that the read-lock has been obtained, check that neither the
@@ -930,15 +942,20 @@ impl Wal for WalFile {
         // file that has not yet been checkpointed. This client will not need
         // to read any frames earlier than minFrame from the wal file - they
         // can be safely read directly from the database file.
-        if mx2 != shared_max
+        if current_slot_mark != best_mark
+            || mx2 != shared_max
             || nb2 != nbackfills
             || cksm2 != last_checksum
             || ckpt_seq2 != checkpoint_seq
         {
-            return Err(LimboError::Busy);
+            // State changed while we were acquiring the lock - release and retry.
+            // This matches SQLite's WAL_RETRY at line 254 of walTryBeginRead.
+            self.with_shared(|shared| shared.read_locks[best_idx as usize].unlock());
+            eprintln!("[BUSY] begin_read_tx: state changed while acquiring lock");
+            return TryBeginReadResult::Retry;
         }
         self.min_frame.store(nb2 + 1, Ordering::Release);
-        self.max_frame.store(best_mark as u64, Ordering::Release);
+        self.max_frame.store(shared_max, Ordering::Release);
         self.max_frame_read_lock_index
             .store(best_idx as usize, Ordering::Release);
         *self.last_checksum.write() = last_checksum;
@@ -952,7 +969,28 @@ impl Wal for WalFile {
             best_idx,
             shared_max
         );
-        Ok(db_changed)
+        TryBeginReadResult::Ok(db_changed)
+    }
+}
+
+impl Wal for WalFile {
+    fn begin_read_tx(&self) -> Result<bool> {
+        // Retry loop with backoff, matching SQLite's walTryBeginRead
+        let mut cnt = 0u32;
+        loop {
+            match self.try_begin_read_tx() {
+                TryBeginReadResult::Ok(changed) => return Ok(changed),
+                TryBeginReadResult::Retry => {
+                    cnt += 1;
+                    // After 100 retries, give up. This matches SQLite's SQLITE_PROTOCOL.
+                    if cnt > 100 {
+                        tracing::warn!("begin_read_tx: exceeded 100 retries, giving up");
+                        return Err(LimboError::Busy);
+                    }
+                    continue;
+                }
+            }
+        }
     }
 
     /// End a read transaction.
@@ -991,10 +1029,14 @@ impl Wal for WalFile {
                 return Ok(());
             }
 
-            // Snapshot is stale, give up and let caller retry from scratch
+            // Snapshot is stale, give up and let caller retry from scratch.
+            // Return BusySnapshot instead of Busy so the caller knows it must
+            // restart the read transaction to get a fresh snapshot.
+            // Retrying with busy_timeout will NEVER HELP.
             tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
+            eprintln!("[BUSY_SNAPSHOT] begin_write_tx: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
             shared.write_lock.unlock();
-            Err(LimboError::Busy)
+            Err(LimboError::BusySnapshot)
         })
     }
 
@@ -1815,7 +1857,7 @@ impl WalFile {
                     } = mode
                     {
                         if max_frame > upper_bound {
-                            tracing::info!("abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}");
+                            eprintln!("abort checkpoint because latest frame in WAL is greater than upper_bound in TRUNCATE mode: {max_frame} != {upper_bound}");
                             return Err(LimboError::Busy);
                         }
                     }
@@ -2032,6 +2074,7 @@ impl WalFile {
                     });
 
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
+                        eprintln!("[BUSY] checkpoint: require_all_backfilled but not everything backfilled");
                         return Err(LimboError::Busy);
                     }
                     if mode.should_restart_log() {
@@ -2186,6 +2229,7 @@ impl WalFile {
                         shared.read_locks[j].unlock();
                     }
                     // Reader is active, cannot proceed
+                    eprintln!("[BUSY] restart_log: read_locks[{}].write() failed, reader active", idx);
                     return Err(LimboError::Busy);
                 }
                 // after the log is reset, we must set all secondary marks to READMARK_NOT_USED so the next reader selects a fresh slot

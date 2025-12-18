@@ -1352,6 +1352,14 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                // BusySnapshot errors do not cause a rollback - user must rollback explicitly.
+                // But for autocommit, we need to end the read tx that was started for this statement.
+                Some(LimboError::BusySnapshot) => {
+                    if state.auto_txn_cleanup == TxnCleanup::RollbackTxn {
+                        pager.end_read_tx();
+                        self.connection.set_tx_state(TransactionState::None);
+                    }
+                }
                 // Constraint errors do not cause a rollback of the transaction by default;
                 // Instead individual statement subtransactions will roll back and these are handled in op_auto_commit
                 // and op_halt.

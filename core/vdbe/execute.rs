@@ -2468,6 +2468,7 @@ pub fn op_auto_commit(
 
     let another_stmt_using_subjournal = !state.uses_subjournal && pager.subjournal_in_use();
     if is_txn_end_eq && another_stmt_using_subjournal {
+        eprintln!("[BUSY] op_auto_commit: another statement is using subjournal, returning Busy");
         return Err(LimboError::Busy);
     }
 
